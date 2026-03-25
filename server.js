@@ -2,14 +2,11 @@
 /**
  * Sol AI Comments — Private Comment Backend
  * =========================================
- * Handles comment submissions for thesolai.github.io
- * - Validates PIN server-side (0620 = Amre)
- * - Blocks reserved names from guest comments
- * - Stores comments in GitHub Issues + local JSON memory
- * - Flags Amre's comments for special styling
- * - CORS-enabled for static site calls
+ * Railway deployment: https://railway.app
+ * Repo: github.com/TheSolAI/thesolai-comments (private)
  *
- * Deploy: Railway.app (connect GitHub repo, set GITHUB_TOKEN env var)
+ * Handles: comment submissions, email storage, PIN verification,
+ *          GitHub Issues backing, Amre's special identity.
  */
 
 const express = require('express');
@@ -18,382 +15,309 @@ const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 
-// ─── Configuration ────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // Required: GitHub PAT
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;   // GitHub PAT
 const GITHUB_OWNER = 'TheSolAI';
-const GITHUB_REPO = 'thesolai.github.io';
+const GITHUB_REPO  = 'thesolai.github.io';
 const COMMENT_LABEL = 'blog-comment';
 
-// Amre's identity
-const AMRE_NAME = 'Amre';
+// Identity
+const AMRE_NAME   = 'Amre';
 const AMRE_AVATAR = 'https://thesolai.github.io/images/amre-avatar.jpg';
 const AMRE_PIN_HASH = crypto.createHash('sha256').update('0620').digest('hex');
 
-// Memory store — persisted to disk
-const DATA_DIR = path.join(__dirname, 'data');
-const MEMORY_FILE = path.join(DATA_DIR, 'comments.json');
+// Memory
+const DATA_DIR     = path.join(__dirname, 'data');
+const COMMENTS_FILE = path.join(DATA_DIR, 'comments.json');
+const EMAILS_FILE   = path.join(DATA_DIR, 'emails.json');
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 const app = express();
 
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type']
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json({ limit: '64kb' }));
 app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 
-// Ensure data directory exists
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-
-// Load memory
-function loadMemory() {
-    if (!fs.existsSync(MEMORY_FILE)) return {};
-    try {
-        return JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
-    } catch (e) {
-        console.error('Memory load error:', e.message);
-        return {};
-    }
-}
-
-// Save memory
-function saveMemory(data) {
-    try {
-        fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2), 'utf8');
-    } catch (e) {
-        console.error('Memory save error:', e.message);
-    }
-}
+['data', 'logs'].forEach(d => { if (!fs.existsSync(path.join(__dirname, d))) fs.mkdirSync(path.join(__dirname, d), { recursive: true }); });
 
 // ─── Memory ───────────────────────────────────────────────────────────────────
 
-/**
- * Comment object shape:
- * {
- *   id: string,          // UUID
- *   slug: string,        // page slug
- *   name: string,        // display name
- *   message: string,     // comment text
- *   isAmre: boolean,     // true if PIN-verified Amre
- *   avatar: string,      // avatar URL or ''
- *   date: string,        // ISO timestamp
- *   githubIssueNumber: number | null
- * }
- */
-
-function addComment(comment) {
-    const mem = loadMemory();
-    if (!mem[comment.slug]) mem[comment.slug] = [];
-    comment.id = crypto.randomUUID();
-    comment.date = new Date().toISOString();
-    mem[comment.slug].push(comment);
-    // Keep last 500 comments per slug
-    if (mem[comment.slug].length > 500) {
-        mem[comment.slug] = mem[comment.slug].slice(-500);
-    }
-    saveMemory(mem);
-    return comment;
+function loadJSON(file) {
+    if (!fs.existsSync(file)) return {};
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
+}
+function saveJSON(file, data) {
+    try { fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8'); } catch (e) { console.error('Save error:', e.message); }
 }
 
-function getComments(slug) {
-    const mem = loadMemory();
-    return mem[slug] || [];
+function loadComments()  { return loadJSON(COMMENTS_FILE); }
+function saveComments(c) { saveJSON(COMMENTS_FILE, c); }
+function loadEmails()   { return loadJSON(EMAILS_FILE); }
+function saveEmails(e)  { saveJSON(EMAILS_FILE, e); }
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Strip email domain — amrree@icloud.com → amrree */
+function emailToDisplayName(email) {
+    if (!email || !email.includes('@')) return null;
+    return email.split('@')[0].toLowerCase().trim().slice(0, 60);
 }
 
-// ─── Name Blocking ─────────────────────────────────────────────────────────────
+/** XSS sanitize */
+function sanitize(msg) {
+    return String(msg)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').slice(0, 2000);
+}
+function sanitizeSlug(s) {
+    if (!s || typeof s !== 'string') return null;
+    return s.replace(/\.\./g, '').replace(/\//g, '-').trim().slice(0, 100) || null;
+}
 
-// Reserved names that only Amre can use
-const RESERVED_NAMES = ['amre', 'eoghan', 'sol', 'admin', 'anonymous', 'guest', 'moderator'];
+// ─── Reserved names (guests cannot claim these) ────────────────────────────────
 
-// Bad words — simple list, expand as needed
-const BLOCKED_WORDS = [
-    'fuck', 'shit', 'ass', 'bitch', 'bastard', 'cunt', 'dick', 'cock',
-    'nigger', 'nigga', 'slut', 'whore', 'faggot', 'retard', 'spastic'
-];
+const RESERVED = new Set(['amre', 'eoghan', 'sol', 'admin', 'anonymous', 'guest', 'moderator', 'owner']);
+const BLOCKED_PATTERNS = /\b(fuck|shit|ass|bitch|bastard|cunt|dick|cock|nigger|nigga|slut|whore|faggot|retard|spastic)\b/gi;
 
 function isNameBlocked(name) {
-    const lower = name.toLowerCase().trim();
-    if (RESERVED_NAMES.includes(lower)) return true;
-    if (BLOCKED_WORDS.some(w => lower.includes(w))) return true;
+    const l = name.toLowerCase().trim();
+    if (RESERVED.has(l)) return true;
+    BLOCKED_PATTERNS.lastIndex = 0;
+    if (BLOCKED_PATTERNS.test(l)) return true;
     return false;
 }
 
-// ─── GitHub Integration ────────────────────────────────────────────────────────
+// ─── GitHub API ────────────────────────────────────────────────────────────────
 
-const GH_BASE = 'https://api.github.com';
-
-async function ghFetch(path, options = {}) {
-    const res = await fetch(`${GH_BASE}${path}`, {
+async function gh(path, options = {}) {
+    const r = await fetch('https://api.github.com' + path, {
         ...options,
-        headers: {
-            'Authorization': `Bearer ${GITHUB_TOKEN}`,
-            'Accept': 'application/vnd.github.v3+json',
-            'Content-Type': 'application/json',
-            'User-Agent': 'thesolai-comments/1.0',
-            ...(options.headers || {})
-        }
+        headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json',
+                   'Content-Type': 'application/json', 'User-Agent': 'thesolai-comments/1.0',
+                   ...(options.headers || {}) }
     });
-    const data = await res.json();
-    if (!res.ok) {
-        throw new Error(`GitHub ${res.status}: ${JSON.stringify(data).slice(0, 200)}`);
-    }
-    return data;
+    const d = await r.json();
+    if (!r.ok) throw new Error(`GitHub ${r.status}: ${JSON.stringify(d).slice(0, 150)}`);
+    return d;
 }
 
 async function findIssue(slug) {
     const q = encodeURIComponent(`repo:${GITHUB_OWNER}/${GITHUB_REPO} "comments: ${slug}" in:title is:issue state:open`);
-    const data = await ghFetch(`/search/issues?q=${q}&per_page=1`);
-    return (data.items && data.items.length > 0) ? data.items[0] : null;
+    const d = await gh(`/search/issues?q=${q}&per_page=1`);
+    return d.items && d.items[0];
 }
 
 async function createIssue(slug) {
-    const slugTitle = slug === 'contact' ? 'contact' : slug;
-    return await ghFetch(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues`, {
-        method: 'POST',
-        body: JSON.stringify({
-            title: `comments: ${slugTitle}`,
-            body: `Comment thread for \`${slugTitle}\`\n\n---\n_Managed by Sol AI comment system._`,
+    return gh(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues`, {
+        method: 'POST', body: JSON.stringify({
+            title: `comments: ${slug}`,
+            body: `Comment thread: \`${slug}\`\n_Managed by Sol AI comment system._`,
             labels: [COMMENT_LABEL]
         })
     });
 }
 
-async function addIssueComment(issueNumber, comment) {
-    // Body format: [NAME:name] [AVATAR:url] [AMRE] [DATE:iso] [ID:uuid]
-    // The [AMRE] flag triggers Amre's special styling on the site
+async function postIssueComment(issueNumber, comment) {
+    // Format: [NAME:name] [AMRE] [DATE:iso] [ID:uuid] [EMAIL:email]
     let prefix = `[NAME:${comment.name}]`;
-    if (comment.avatar) prefix += ` [AVATAR:${comment.avatar}]`;
     if (comment.isAmre) prefix += ' [AMRE]';
-    prefix += ` [DATE:${comment.date}]`;
-    prefix += ` [ID:${comment.id}]`;
-    const body = prefix + '\n\n' + comment.message;
-
-    return await ghFetch(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${issueNumber}/comments`, {
-        method: 'POST',
-        body: JSON.stringify({ body })
+    prefix += ` [DATE:${comment.date}] [ID:${comment.id}]`;
+    if (comment.email) prefix += ` [EMAIL:${comment.email}]`;
+    return gh(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${issueNumber}/comments`, {
+        method: 'POST', body: JSON.stringify({ body: prefix + '\n\n' + comment.message })
     });
+}
+
+// ─── Comment operations ─────────────────────────────────────────────────────────
+
+function addComment(c) {
+    const all = loadComments();
+    if (!all[c.slug]) all[c.slug] = [];
+    c.id = crypto.randomUUID();
+    c.date = new Date().toISOString();
+    all[c.slug].push(c);
+    if (all[c.slug].length > 500) all[c.slug] = all[c.slug].slice(-500);
+    saveComments(all);
+    return c;
+}
+
+function getComments(slug) {
+    return (loadComments())[slug] || [];
+}
+
+// ─── Email operations ───────────────────────────────────────────────────────────
+
+function storeEmail(email, meta = {}) {
+    const emails = loadEmails();
+    const key = email.toLowerCase();
+    emails[key] = { email, added: new Date().toISOString(), ...meta };
+    saveEmails(emails);
+}
+
+function isEmailStored(email) {
+    return email && loadEmails().hasOwnProperty(email.toLowerCase());
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// GET /health
+// GET / — health
 app.get('/', (req, res) => {
     res.json({
-        status: 'ok',
-        service: 'thesolai-comments',
-        github: GITHUB_TOKEN ? 'configured' : 'missing token',
-        uptime: Math.floor(process.uptime()) + 's'
+        status: 'ok', service: 'thesolai-comments',
+        github: GITHUB_TOKEN ? 'configured' : 'MISSING TOKEN',
+        uptime: Math.floor(process.uptime()) + 's',
+        comments: Object.values(loadComments()).flat().length
     });
 });
 
-// GET /comments/:slug — fetch all comments for a page
+// GET /comments/:slug
 app.get('/comments/:slug', async (req, res) => {
     const slug = sanitizeSlug(req.params.slug);
     if (!slug) return res.status(400).json({ error: 'Invalid slug' });
 
     try {
-        // Load from memory first (fast)
-        const memoryComments = getComments(slug);
+        let comments = getComments(slug);
 
-        // Also try to fetch from GitHub Issues (for comments posted before server started)
-        let githubComments = [];
-        if (GITHUB_TOKEN) {
+        // Sync from GitHub if we have a token (for pre-server comments)
+        if (GITHUB_TOKEN && comments.length === 0) {
             try {
                 const issue = await findIssue(slug);
                 if (issue) {
-                    const comments = await ghFetch(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${issue.number}/comments`);
-                    githubComments = comments.map(c => parseIssueComment(c));
+                    const ghComments = await gh(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${issue.number}/comments`);
+                    for (const c of ghComments.reverse()) {
+                        const parsed = parseIssueComment(c);
+                        if (!comments.find(x => x.id === parsed.id)) comments.push(parsed);
+                    }
                 }
-            } catch (e) {
-                console.warn('GitHub fetch warning:', e.message);
-            }
+            } catch (e) { console.warn('GitHub sync:', e.message); }
         }
 
-        // Deduplicate by ID — prefer memory over GitHub
-        const seen = new Set(memoryComments.map(c => c.id));
-        const merged = [
-            ...memoryComments,
-            ...githubComments.filter(c => !seen.has(c.id))
-        ];
-
-        // Sort by date ascending
-        merged.sort((a, b) => new Date(a.date) - new Date(b.date));
-
-        res.json({ slug, count: merged.length, comments: merged });
+        comments.sort((a, b) => new Date(a.date) - new Date(b.date));
+        res.json({ slug, count: comments.length, comments });
     } catch (err) {
         console.error('GET /comments error:', err.message);
         res.status(500).json({ error: 'Failed to load comments' });
     }
 });
 
-// POST /comment — submit a new comment
+// POST /comment
 app.post('/comment', async (req, res) => {
-    const { name, message, slug, pin } = req.body;
+    const { name, message, slug, pin, email } = req.body;
 
-    // Validate message
-    if (!message || !message.trim()) {
-        return res.status(400).json({ error: 'Message is required' });
-    }
-    if (message.length > 2000) {
-        return res.status(400).json({ error: 'Message too long (max 2000 characters)' });
-    }
-
+    if (!message || !message.trim())  return res.status(400).json({ error: 'Message is required' });
+    if (message.length > 2000)       return res.status(400).json({ error: 'Message too long (max 2000)' });
     const cleanSlug = sanitizeSlug(slug);
-    if (!cleanSlug) return res.status(400).json({ error: 'Invalid slug' });
+    if (!cleanSlug)                  return res.status(400).json({ error: 'Invalid slug' });
 
-    // Validate name
-    const cleanName = (name || 'Guest').trim().slice(0, 60);
-    if (!cleanName) return res.status(400).json({ error: 'Name is required' });
+    // ── Email ──
+    // If email provided, store it. Used for blocking/reference.
+    // The email address is stored but NEVER exposed via the API.
+    if (email && typeof email === 'string' && email.includes('@')) {
+        storeEmail(email.trim(), { slug: cleanSlug });
+    } else if (email) {
+        return res.status(400).json({ error: 'Invalid email address' });
+    }
 
-    // Check if PIN is correct
+    // ── Identity ──
+    // Check PIN: last 4 digits of whatever is entered
     let isAmre = false;
     if (pin && pin.length >= 4) {
-        const last4 = pin.slice(-4);
-        const hash = crypto.createHash('sha256').update(last4).digest('hex');
+        const hash = crypto.createHash('sha256').update(pin.slice(-4)).digest('hex');
         isAmre = (hash === AMRE_PIN_HASH);
     }
 
-    // Name blocking — guests cannot use reserved names
-    if (!isAmre && isNameBlocked(cleanName)) {
-        return res.status(400).json({
-            error: 'That name is not available. Choose something else.'
-        });
+    // ── Name resolution ──
+    // If Amre (PIN correct): use her name regardless of what was typed
+    // If email provided but no name: use email username as display name
+    // If name typed: use it (after checking it's not reserved)
+    let displayName;
+    if (isAmre) {
+        displayName = AMRE_NAME;
+    } else if (name && name.trim()) {
+        const n = name.trim().slice(0, 60);
+        if (isNameBlocked(n)) return res.status(400).json({ error: 'That name is not available. Choose something else.' });
+        displayName = n;
+    } else if (email) {
+        const derived = emailToDisplayName(email);
+        if (!derived) return res.status(400).json({ error: 'Could not derive name from email.' });
+        displayName = derived;
+    } else {
+        return res.status(400).json({ error: 'Name or email is required.' });
     }
 
-    // Sanitize message — escape HTML to prevent XSS
-    const cleanMessage = sanitizeMessage(message.trim());
-
-    // Determine display name and avatar
-    const displayName = isAmre ? AMRE_NAME : cleanName;
-    const displayAvatar = isAmre ? AMRE_AVATAR : '';
-
-    // Build comment object
     const comment = {
-        id: '', // filled by addComment
-        slug: cleanSlug,
+        id: '', slug: cleanSlug,
         name: displayName,
-        message: cleanMessage,
-        isAmre,
-        avatar: displayAvatar,
-        date: '' // filled by addComment
+        message: sanitize(message.trim()),
+        isAmre, email: email || null,
+        avatar: isAmre ? AMRE_AVATAR : '',
+        date: ''
     };
 
-    // Store in memory
     const stored = addComment(comment);
 
-    // Post to GitHub Issues if token available
+    // ── GitHub ──
     if (GITHUB_TOKEN) {
         try {
             let issue = await findIssue(cleanSlug);
             if (!issue) issue = await createIssue(cleanSlug);
-            const ghComment = await addIssueComment(issue.number, stored);
-            // Update issue number in memory
+            const ghComment = await postIssueComment(issue.number, stored);
             stored.githubIssueNumber = issue.number;
             stored.githubCommentId = ghComment.id;
-            // Re-save with issue number
-            const mem = loadMemory();
-            const idx = mem[cleanSlug].findIndex(c => c.id === stored.id);
-            if (idx !== -1) mem[cleanSlug][idx] = stored;
-            saveMemory(mem);
-        } catch (e) {
-            console.error('GitHub post error (comment still stored locally):', e.message);
-        }
+            const all = loadComments();
+            const idx = all[cleanSlug].findIndex(c => c.id === stored.id);
+            if (idx !== -1) all[cleanSlug][idx] = stored;
+            saveComments(all);
+        } catch (e) { console.error('GitHub post error:', e.message); }
     }
 
     res.json({
-        success: true,
-        identity: isAmre ? 'amre' : 'guest',
-        name: displayName,
-        isAmre,
-        avatar: displayAvatar,
-        id: stored.id,
+        success: true, identity: isAmre ? 'amre' : 'guest',
+        name: displayName, isAmre,
+        avatar: stored.avatar, id: stored.id,
         message: 'Comment posted'
     });
 });
 
-// GET /count/:slug — get comment count for a page (lightweight)
-app.get('/count/:slug', (req, res) => {
-    const slug = sanitizeSlug(req.params.slug);
-    if (!slug) return res.status(400).json({ error: 'Invalid slug' });
-    const comments = getComments(slug);
-    res.json({ slug, count: comments.length });
+// GET /emails — admin only (returns email count, not addresses)
+app.get('/emails', (req, res) => {
+    const emails = loadEmails();
+    res.json({ count: Object.keys(emails).length });
 });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function sanitizeSlug(slug) {
-    if (!slug || typeof slug !== 'string') return null;
-    // Remove path traversal, limit length
-    const clean = slug.replace(/\.\./g, '').replace(/\//g, '-').trim().slice(0, 100);
-    return clean || null;
-}
-
-function sanitizeMessage(msg) {
-    if (!msg) return '';
-    return msg
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .slice(0, 2000);
-}
+// ─── Parse GitHub Issue comment ───────────────────────────────────────────────
 
 function parseIssueComment(c) {
-    // Parse body format: [NAME:name] [AVATAR:url] [AMRE] [DATE:iso] [ID:uuid]
-    // Everything after the metadata blocks is the message
-    let name = 'Guest';
-    let avatar = '';
-    let isAmre = false;
-    let date = c.created_at;
-    let id = '';
-    let message = c.body;
+    let name = 'Guest', avatar = '', isAmre = false, date = c.created_at, id = '', ghEmail = null;
+    let msg = c.body;
 
-    const nameMatch = c.body.match(/^\[NAME:([^\]]+)\]/);
-    const avatarMatch = c.body.match(/\[AVATAR:([^\]]+)\]/);
-    const amreMatch = c.body.match(/\[AMRE\]/);
-    const dateMatch = c.body.match(/\[DATE:([^\]]+)\]/);
-    const idMatch = c.body.match(/\[ID:([^\]]+)\]/);
+    ['NAME', 'AVATAR', 'AMRE', 'DATE', 'ID', 'EMAIL'].forEach(field => {
+        const re = new RegExp(`\\[${field}:([^\\]]+)\\]`);
+        const m = msg.match(re);
+        if (!m) return;
+        if (field === 'NAME') name = m[1];
+        else if (field === 'AVATAR') avatar = m[1];
+        else if (field === 'AMRE') isAmre = true;
+        else if (field === 'DATE') date = m[1];
+        else if (field === 'ID') id = m[1];
+        else if (field === 'EMAIL') ghEmail = m[1];
+    });
 
-    if (nameMatch) name = nameMatch[1];
-    if (avatarMatch) avatar = avatarMatch[1];
-    if (amreMatch) isAmre = true;
-    if (dateMatch) date = dateMatch[1];
-    if (idMatch) id = idMatch[1];
+    msg = msg.replace(/^\[NAME:[^\]]+\]\s*/, '')
+             .replace(/\[AVATAR:[^\]]+\]\s*/, '').replace(/\[AMRE\]\s*/, '')
+             .replace(/\[DATE:[^\]]+\]\s*/, '').replace(/\[ID:[^\]]+\]\s*/, '')
+             .replace(/\[EMAIL:[^\]]+\]\s*/, '').trim();
 
-    // Strip metadata prefix from message
-    message = c.body
-        .replace(/^\[NAME:[^\]]+\]\s*/, '')
-        .replace(/\[AVATAR:[^\]]+\]\s*/, '')
-        .replace(/\[AMRE\]\s*/, '')
-        .replace(/\[DATE:[^\]]+\]\s*/, '')
-        .replace(/\[ID:[^\]]+\]\s*/, '')
-        .trim();
-
-    return {
-        id,
-        name,
-        avatar,
-        isAmre,
-        message,
-        date,
-        githubCommentId: c.id
-    };
+    return { id, name, avatar, isAmre, message: msg, date, email: ghEmail };
 }
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
-    console.log(`thesolai-comments listening on port ${PORT}`);
-    if (!GITHUB_TOKEN) {
-        console.error('FATAL: GITHUB_TOKEN not set. Set it in Railway environment variables.');
-    } else {
-        console.log('GitHub: configured');
-        console.log('Memory file:', MEMORY_FILE);
-    }
+    console.log(`[${new Date().toISOString()}] thesolai-comments started on :${PORT}`);
+    if (!GITHUB_TOKEN) console.error('FATAL: GITHUB_TOKEN env var not set');
+    else console.log('GitHub: connected');
 });
