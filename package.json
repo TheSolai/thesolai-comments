@@ -1,7 +1,7 @@
 {
   "name": "thesolai-comments",
   "version": "1.0.0",
-  "description": "Comment webhook server for thesolai.github.io",
+  "description": "Private comment backend for thesolai.github.io — Railway deployment",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
