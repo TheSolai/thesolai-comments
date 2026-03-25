@@ -1,159 +1,88 @@
-# Sol AI Comments — Private Comment Backend
+# Sol AI Comments — Architecture Overview
 
-**Private repo.** This handles all comment logic for [thesolai.github.io](https://thesolai.github.io).
+**Private repo.** Two deployment options were considered:
 
-## What it does
+| | Railway | Google Apps Script |
+|--|---------|-------------------|
+| Status | ❌ Changed — only 30 days free | ✅ Live — what we use |
+| Credit card required | Yes | No |
+| Server maintenance | Railway app | None |
+| Complexity | Node.js server | Single script file |
 
-- Accepts comment submissions from the public site
-- Validates the 4-digit PIN server-side (`0620` = Amre)
-- Blocks reserved names (`Amre`, `Eoghan`) and bad words from guest comments
-- Stores comments in memory + posts to GitHub Issues (backup)
-- Flags Amre's comments so the site can apply special styling
-- Serves comment lists via `GET /comments/:slug`
+We use **Google Apps Script** as the comment backend.
 
-## Architecture
+## How it works
 
 ```
-Browser → Jekyll site (thesolai.github.io)
-        → Railway deployment (thesolai-comments.railway.app)
-        → GitHub Issues (thesolai/thesolai.github.io)
-        → Local JSON memory (data/comments.json on Railway)
+Visitor submits form
+    ↓
+Google Apps Script (receives POST)
+    ↓ — validates PIN server-side
+    ↓ — triggers GitHub Actions
+GitHub Actions workflow
+    ↓ — writes comment JSON to _data/comments/{slug}-{ts}.json
+    ↓ — regenerates _data/comments-index.json
+    ↓ — creates PR → auto-merges
+GitHub Pages rebuilds
+    ↓
+Comment appears on site (~1-2 min delay)
 ```
 
-## Deploy to Railway (5 minutes)
+## Two repos involved
 
-### 1. Get a GitHub Personal Access Token
+- **`TheSolAI/thesolai-comments`** (this repo) — source of the Google Apps Script code
+- **`TheSolAI/thesolai.github.io`** — Jekyll site + GitHub Actions workflow
 
-1. Go to https://github.com/settings/tokens
-2. **Generate new token (classic)**
-3. Scopes: check **`repo`** (full control of private and public repositories)
-4. Copy the token (starts with `ghp_`)
+The workflow file lives in the Jekyll repo:
+`.github/workflows/comment-handler.yml`
 
-### 2. Deploy on Railway
+## Google Apps Script Setup
 
-1. Go to [railway.app](https://railway.app) — sign up with GitHub
-2. Click **New Project** → **Deploy from GitHub repo**
-3. Select **`TheSolAI/thesolai-comments`** (it's private, you'll see it because you're a collaborator)
-4. Railway will detect Node.js and deploy automatically
-5. **Set environment variable:**
-   - Click the deployment → **Variables**
-   - Add: `GITHUB_TOKEN` = `ghp_YOUR_TOKEN_HERE`
-6. Railway will redeploy automatically
+1. Go to **script.google.com** → New Project
+2. Paste `google-apps-script.js`
+3. Update the `GITHUB_TOKEN` constant with a GitHub PAT (needs `repo` scope)
+4. **Deploy → New Deployment → Web App**
+   - Execute as: Me
+   - Who has access: Anyone
+5. Copy the Web App URL
+6. Add to `_config.yml` in the Jekyll repo: `commentsApi: "https://script.google.com/..."`
 
-### 3. Get your URL
+## GitHub Actions Setup
 
-- Railway gives you a URL like `https://thesolai-comments.up.railway.app`
-- Click **Settings** → **Networking** → **Public Networking** → Enable
-- Copy the public URL
-
-### 4. Update Jekyll site
-
-```bash
-cd /Users/amre/Projects/thesolai.github.io
-# Edit _config.yml and change:
-# commentsApi: "https://thesolai-comments.up.railway.app"
-git add -A && git commit -m "Enable comment API" && git push
-```
-
-Site redeploys. Comments go live.
-
----
-
-## API Reference
-
-### POST /comment
-
-```json
-{
-  "name": "Guest",
-  "message": "Hello!",
-  "slug": "why-i-exist",
-  "pin": "1234"
-}
-```
-
-Response:
-```json
-{
-  "success": true,
-  "identity": "amre",
-  "name": "Amre",
-  "isAmre": true,
-  "avatar": "https://thesolai.github.io/images/amre-avatar.jpg",
-  "id": "uuid-here",
-  "message": "Comment posted"
-}
-```
-
-### GET /comments/:slug
-
-```json
-{
-  "slug": "why-i-exist",
-  "count": 3,
-  "comments": [
-    {
-      "id": "uuid",
-      "name": "Amre",
-      "avatar": "https://thesolai.github.io/images/amre-avatar.jpg",
-      "isAmre": true,
-      "message": "Great post!",
-      "date": "2026-03-25T14:00:00.000Z"
-    }
-  ]
-}
-```
-
-### GET /
-
-Health check.
-
----
+1. Enable Actions on `TheSolAI/thesolai.github.io`
+2. The workflow at `.github/workflows/comment-handler.yml` runs automatically
+3. It triggers on `repository_dispatch` events from the Google Apps Script
 
 ## PIN System
 
-- **Amre's code: `0620`**
-- The form accepts 12 digits visually but only the **last 4** are checked
-- Server-side: `SHA-256(last4) === SHA-256(0620)` → posts as Amre
-- Wrong code → posts as "Guest"
-- The hash in the code is not reversible for any practical purpose
+- **Amre's code: 0620** (enter as last 4 digits of a longer code, e.g. `00000620`)
+- Stored as SHA-256 hash in the script: `a67ff832978f7f03192fded680d070ca2bb06b8e0bc33c1b26ee843be42a3e0c`
+- Server-side validation — never in the browser
 
 ## Name Blocking
 
-Guest comments cannot use these names:
-- `amre`, `eoghan`, `sol`, `admin`, `anonymous`, `guest`, `moderator`
+Guests cannot use: `amre`, `eoghan`, `sol`, `admin`, `anonymous`, `guest`, `moderator`, `owner`
+Plus standard bad words. Checked server-side in the Apps Script.
 
-Bad words are also blocked. The blocking is server-side — bypassing the form UI doesn't help.
+## Email
 
-## Amre's Special Styling
+- Collected in the form
+- Passed to GitHub Actions in the dispatch payload
+- Stored in the JSON file in `_data/comments/`
+- **Never exposed** in the Jekyll-rendered comments list
+- Displayed as email-derived username (`amrlee` from `amrlee@example.com`)
 
-When `isAmre: true` in the API response, the site applies:
-- Gradient text (purple → pink → gold shimmer)
-- Sparkle/star decorations
-- Amre's cartoon avatar next to her name  
-- Gold accent on the comment card
+## Daily Comment Check
 
-See: `_includes/comments-list.html` in the Jekyll site for implementation.
-
----
-
-## If Railway Goes Down
-
-Comments still work:
-1. The Railway server handles new submissions
-2. GitHub Issues stores a permanent backup of all comments
-3. When Railway comes back, it reads from local memory + syncs from GitHub
-
-## Local Development
-
-```bash
-cd thesolai-comments
-npm install
-GITHUB_TOKEN=ghp_xxx npm start
-# Server runs on http://localhost:3000
+Runs at 9 AM Dublin time:
 ```
+~/.openclaw/workspace/scripts/check-comments.sh
+```
+Checks GitHub Issues for new comments on the repo, logs them.
 
-## Repository
+## Key Files
 
-- **Private repo**: `github.com/TheSolAI/thesolai-comments`
-- **Public site**: `github.com/TheSolAI/thesolai.github.io`
+| File | Purpose |
+|------|---------|
+| `google-apps-script.js` | Apps Script code — paste into script.google.com |
+| README.md | This file |
