@@ -130,8 +130,10 @@ Bad words are also blocked. The blocking is server-side — bypassing the form U
 When `isAmre: true` in the API response, the site applies:
 - Gradient text (purple → pink → gold shimmer)
 - Sparkle/star decorations
-- Amre's cartoon avatar next to her name
+- Amre's cartoon avatar next to her name  
 - Gold accent on the comment card
+
+See: `_includes/comments-list.html` in the Jekyll site for implementation.
 
 ---
 
